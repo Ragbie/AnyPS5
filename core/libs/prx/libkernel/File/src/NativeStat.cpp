@@ -7,6 +7,7 @@
 #include <string>
 
 #ifdef _WIN32
+#include "prx/libkernel/File/include/SharedMemory.hpp"
 #include "prx/libkernel/File/include/WindowsFileTime.hpp"
 #include <io.h>
 #include <sys/stat.h>
@@ -151,6 +152,14 @@ bool FillFileStatFromDescriptor(int fd, FileStat* sb) {
     NativeStat st{};
     if (DoFstat(fd, &st) != 0) return false;
     CopyNativeStat(st, sb);
+#ifdef _WIN32
+    const auto size = SharedMemorySize_nid_no_patch(fd);
+    if (size == -1) return false;
+    if (size >= 0) {
+        sb->st_size = size;
+        sb->st_blocks = (size + 511LL) / 512LL;
+    }
+#endif
     return true;
 }
 

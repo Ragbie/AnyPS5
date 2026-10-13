@@ -51,6 +51,8 @@ static int NativeRead(int fd, void* buf, std::size_t n) {
     if (n > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
         throw std::runtime_error("sceKernelRead: nbytes exceeds platform limit");
     }
+    const auto shared = File::ReadSharedMemory_nid_no_patch(fd, buf, n);
+    if (shared != -2) return static_cast<int>(shared);
     const int result = ::_read(fd, buf, static_cast<unsigned int>(n));
     if (result < 0 && _doserrno == ERROR_NO_DATA) errno = EAGAIN;
     return result;
@@ -230,6 +232,7 @@ int APS5_VABI sceKernelClose(int d) {
 #ifdef _WIN32
     File::ForgetDirectoryDescriptor(d);
     File::ForgetFileLock(d);
+    File::ForgetSharedMemory_nid_no_patch(d);
 #endif
     if (NativeClose(d) != 0) {
         if (errno == EBADF) return SCE_KERNEL_ERROR_EBADF;

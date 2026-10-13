@@ -18,6 +18,8 @@
 #include <mutex>
 
 #ifdef _WIN32
+#include "prx/libkernel/DirectMemory/DirectMemory.hpp"
+#include <map>
 #include <windows.h>
 #include <fcntl.h>
 #include <io.h>
@@ -45,32 +47,90 @@ constexpr std::wstring_view anonymousObjectPrefix = L"anyps5-shm-";
 
 void IgnoreInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, std::uintptr_t) {}
 
-bool IsAnonymousObjectHandle(HANDLE handle) {
-    if (::GetFileType(handle) != FILE_TYPE_DISK) return false;
+std::optional<std::wstring> AnonymousObjectHandleName(HANDLE handle) {
+    if (::GetFileType(handle) != FILE_TYPE_DISK) return std::nullopt;
     FILE_BASIC_INFO basic{};
     if (!::GetFileInformationByHandleEx(handle, FileBasicInfo, &basic, sizeof(basic)) ||
-        (basic.FileAttributes & FILE_ATTRIBUTE_TEMPORARY) == 0) return false;
+        (basic.FileAttributes & FILE_ATTRIBUTE_TEMPORARY) == 0) return std::nullopt;
     std::wstring path(MAX_PATH, L'\0');
     auto length = ::GetFinalPathNameByHandleW(handle, path.data(), static_cast<DWORD>(path.size()), FILE_NAME_NORMALIZED);
     if (length >= path.size()) {
         path.resize(length);
         length = ::GetFinalPathNameByHandleW(handle, path.data(), length, FILE_NAME_NORMALIZED);
     }
-    if (length == 0 || length >= path.size()) return false;
+    if (length == 0 || length >= path.size()) return std::nullopt;
     path.resize(length);
-    return std::filesystem::path(path).filename().wstring().starts_with(anonymousObjectPrefix);
+    auto name = std::filesystem::path(path).filename().wstring();
+    if (!name.starts_with(anonymousObjectPrefix)) return std::nullopt;
+    return name;
+}
+
+std::optional<std::wstring> AnonymousObjectName(int descriptor) {
+    const int savedError = errno;
+    const auto previous = _set_thread_local_invalid_parameter_handler(IgnoreInvalidParameter);
+    const auto handle = reinterpret_cast<HANDLE>(::_get_osfhandle(descriptor));
+    _set_thread_local_invalid_parameter_handler(previous);
+    auto name = handle != INVALID_HANDLE_VALUE ? AnonymousObjectHandleName(handle) : std::nullopt;
+    errno = savedError;
+    return name;
+}
+
+struct AnonymousObject {
+    std::int64_t size = 0;
+    std::size_t descriptors = 0;
+};
+
+std::mutex g_anonymousObjectsLock;
+std::map<std::wstring, AnonymousObject> g_anonymousObjects;
+std::map<int, std::wstring> g_anonymousDescriptors;
+std::atomic<std::size_t> g_anonymousDescriptorCount{0};
+
+void ForgetAnonymousDescriptor(int descriptor) {
+    const auto entry = g_anonymousDescriptors.find(descriptor);
+    if (entry == g_anonymousDescriptors.end()) return;
+    const auto object = g_anonymousObjects.find(entry->second);
+    if (object != g_anonymousObjects.end() && --object->second.descriptors == 0) g_anonymousObjects.erase(object);
+    g_anonymousDescriptors.erase(entry);
+    g_anonymousDescriptorCount.store(g_anonymousDescriptors.size());
+}
+
+void RememberAnonymousDescriptor(int descriptor, const std::wstring& name) {
+    std::lock_guard lock(g_anonymousObjectsLock);
+    ForgetAnonymousDescriptor(descriptor);
+    ++g_anonymousObjects[name].descriptors;
+    g_anonymousDescriptors.emplace(descriptor, name);
+    g_anonymousDescriptorCount.store(g_anonymousDescriptors.size());
+}
+
+bool IsAnonymousDescriptor(int descriptor) {
+    if (g_anonymousDescriptorCount.load() == 0) return false;
+    std::lock_guard lock(g_anonymousObjectsLock);
+    return g_anonymousDescriptors.contains(descriptor);
+}
+
+std::optional<std::int64_t> AnonymousObjectSize(const std::wstring& name) {
+    std::lock_guard lock(g_anonymousObjectsLock);
+    const auto object = g_anonymousObjects.find(name);
+    if (object == g_anonymousObjects.end()) return std::nullopt;
+    return object->second.size;
+}
+
+void SetAnonymousObjectSize(const std::wstring& name, std::int64_t size) {
+    std::lock_guard lock(g_anonymousObjectsLock);
+    const auto object = g_anonymousObjects.find(name);
+    if (object != g_anonymousObjects.end()) object->second.size = size;
+}
+
+std::int64_t RoundToPage(std::int64_t size) {
+    constexpr auto page = static_cast<std::int64_t>(PS5_PAGE_SIZE);
+    if (size > std::numeric_limits<std::int64_t>::max() - (page - 1)) return size;
+    return (size + page - 1) / page * page;
 }
 #endif
 
 bool IsHostSharedMemoryDescriptor(int descriptor) {
 #ifdef _WIN32
-    const int savedError = errno;
-    const auto previous = _set_thread_local_invalid_parameter_handler(IgnoreInvalidParameter);
-    const auto handle = reinterpret_cast<HANDLE>(::_get_osfhandle(descriptor));
-    _set_thread_local_invalid_parameter_handler(previous);
-    const bool anonymous = handle != INVALID_HANDLE_VALUE && IsAnonymousObjectHandle(handle);
-    errno = savedError;
-    return anonymous;
+    return AnonymousObjectName(descriptor).has_value();
 #elif defined(__linux__)
     char descriptorPath[64];
     std::snprintf(descriptorPath, sizeof(descriptorPath), "/proc/self/fd/%d", descriptor);
@@ -293,7 +353,13 @@ public:
         if (hostLock->Error() != 0) { error = hostLock->Error(); return; }
         descriptor = Duplicate(value);
         if (descriptor < 0) { error = errno; return; }
+#ifdef _WIN32
+        auto objectName = AnonymousObjectName(descriptor);
+        if (!objectName) { error = EBADF; return; }
+        name = std::move(*objectName);
+#else
         if (!IsHostSharedMemoryDescriptor(descriptor)) { error = EBADF; return; }
+#endif
         if (!Refresh()) { error = errno; return; }
 #ifdef __linux__
         if (status.st_dev != originalStatus.st_dev || status.st_ino != originalStatus.st_ino) error = EBADF;
@@ -319,13 +385,18 @@ public:
 #ifdef _WIN32
         struct _stat64 nativeStatus{};
         if (::_fstat64(descriptor, &nativeStatus) != 0) return false;
-        status.st_size = nativeStatus.st_size;
+        physical = nativeStatus.st_size;
+        status.st_size = AnonymousObjectSize(name).value_or(physical);
         return true;
 #else
         return ::fstat(descriptor, &status) == 0;
 #endif
     }
     struct stat status{};
+#ifdef _WIN32
+    const std::wstring& Name() const { return name; }
+    std::int64_t Physical() const { return physical; }
+#endif
 
 private:
     static int Duplicate(int value) {
@@ -340,6 +411,10 @@ private:
     std::optional<HostShmLock> hostLock;
     bool shared = false;
     int error = 0;
+#ifdef _WIN32
+    std::wstring name;
+    std::int64_t physical = 0;
+#endif
 };
 }
 
@@ -491,14 +566,29 @@ int TruncateSharedMemory_nid_no_patch(int descriptor, std::int64_t length) {
 #endif
     const auto fd = guard.Descriptor();
 #ifdef _WIN32
-    const int result = static_cast<int>(::_chsize_s(fd, length));
-    if (result != 0 && _doserrno == ERROR_USER_MAPPED_FILE) {
-        NotImplemented_nid_no_patch("ftruncate shrinking a mapped shared memory object on Windows");
+    if (!guard.Refresh()) return errno;
+    const bool tracked = AnonymousObjectSize(guard.Name()).has_value();
+    const auto physical = tracked ? RoundToPage(length) : length;
+    if (physical != guard.Physical()) {
+        const int result = static_cast<int>(::_chsize_s(fd, physical));
+        if (result != 0 && _doserrno == ERROR_USER_MAPPED_FILE) {
+            NotImplemented_nid_no_patch("ftruncate shrinking a mapped shared memory object on Windows");
+        }
+        if (result != 0) return result;
     }
+    if (!tracked) return 0;
+    SetAnonymousObjectSize(guard.Name(), length);
+    if (length < guard.status.st_size && physical > length) {
+        const std::vector<char> zeros(static_cast<std::size_t>(physical - length));
+        const auto written = NativePositionedFile_nid_no_patch(fd, const_cast<char*>(zeros.data()), zeros.size(), length, true);
+        if (written != static_cast<std::int64_t>(zeros.size())) {
+            throw std::runtime_error("ftruncate: clearing the truncated part of the last shared memory page failed");
+        }
+    }
+    return 0;
 #else
-    const int result = ::ftruncate(fd, static_cast<off_t>(length));
+    return ::ftruncate(fd, static_cast<off_t>(length));
 #endif
-    return result;
 }
 
 #ifdef _WIN32
@@ -507,13 +597,61 @@ void* SharedMemorySection_nid_no_patch(int descriptor, std::uint64_t end) {
     if (!guard.IsShared()) throw std::system_error(EBADF, std::generic_category(), "map shared memory: not a shared memory descriptor");
     if (guard.Error() != 0) throw std::system_error(guard.Error(), std::generic_category(), "map shared memory");
     if (!guard.Refresh()) throw std::system_error(errno, std::generic_category(), "map shared memory: reading the object size");
-    if (end > static_cast<std::uint64_t>(guard.status.st_size)) {
+    if (end > static_cast<std::uint64_t>(std::min(RoundToPage(guard.status.st_size), guard.Physical()))) {
         throw std::system_error(ENOTSUP, std::generic_category(), "map shared memory: beyond the object size");
     }
     const auto handle = reinterpret_cast<HANDLE>(::_get_osfhandle(guard.Descriptor()));
     const HANDLE section = ::CreateFileMappingW(handle, nullptr, PAGE_EXECUTE_READWRITE, 0, 0, nullptr);
     if (section == nullptr) throw std::system_error(ENOMEM, std::generic_category(), "map shared memory: creating the section");
     return section;
+}
+
+std::int64_t ReadSharedMemory_nid_no_patch(int descriptor, void* buffer, std::size_t size) {
+    if (!IsAnonymousDescriptor(descriptor)) return -2;
+    SharedMemoryLock guard(descriptor);
+    if (!guard.IsShared()) return -2;
+    if (guard.Error() != 0) { errno = guard.Error(); return -1; }
+    const auto fd = guard.Descriptor();
+    const auto position = ::_lseeki64(fd, 0, SEEK_CUR);
+    if (position < 0) return -1;
+    if (position >= guard.status.st_size) return 0;
+    const auto count = std::min<std::uint64_t>({size, static_cast<std::uint64_t>(guard.status.st_size - position),
+                                                std::numeric_limits<unsigned int>::max()});
+    return ::_read(fd, buffer, static_cast<unsigned int>(count));
+}
+
+std::int64_t PreadSharedMemory_nid_no_patch(int descriptor, void* buffer, std::size_t size, std::int64_t offset) {
+    if (!IsAnonymousDescriptor(descriptor)) return -2;
+    SharedMemoryLock guard(descriptor);
+    if (!guard.IsShared()) return -2;
+    if (guard.Error() != 0) { errno = guard.Error(); return -1; }
+    if (offset < 0) { errno = EINVAL; return -1; }
+    if (offset >= guard.status.st_size) return 0;
+    const auto count = std::min<std::uint64_t>(size, static_cast<std::uint64_t>(guard.status.st_size - offset));
+    return NativePositionedFile_nid_no_patch(guard.Descriptor(), buffer, static_cast<std::size_t>(count), offset, false);
+}
+
+std::int64_t SharedMemorySize_nid_no_patch(int descriptor) {
+    if (!IsAnonymousDescriptor(descriptor)) return -2;
+    SharedMemoryLock guard(descriptor);
+    if (!guard.IsShared()) return -2;
+    if (guard.Error() != 0) { errno = guard.Error(); return -1; }
+    return guard.status.st_size;
+}
+
+void ForgetSharedMemory_nid_no_patch(int descriptor) {
+    std::lock_guard lock(g_anonymousObjectsLock);
+    ForgetAnonymousDescriptor(descriptor);
+}
+
+void DuplicateSharedMemory_nid_no_patch(int from, int to) {
+    std::lock_guard lock(g_anonymousObjectsLock);
+    ForgetAnonymousDescriptor(to);
+    const auto source = g_anonymousDescriptors.find(from);
+    if (source == g_anonymousDescriptors.end()) return;
+    ++g_anonymousObjects[source->second].descriptors;
+    g_anonymousDescriptors.emplace(to, source->second);
+    g_anonymousDescriptorCount.store(g_anonymousDescriptors.size());
 }
 #endif
 
@@ -532,7 +670,19 @@ extern "C" int APS5_VABI shm_open_nid_postfix(const char* path, int flags, int m
     }
     if (accessMode == SCE_KERNEL_O_RDONLY) return Fail(GuestInvalid);
     const int descriptor = CreateAnonymousFile();
+#ifdef _WIN32
+    if (descriptor >= 0) {
+        const auto name = AnonymousObjectName(descriptor);
+        if (!name) {
+            ::_close(descriptor);
+            throw std::runtime_error("shm_open: the host anonymous file is not recognized as an object");
+        }
+        RememberAnonymousDescriptor(descriptor, *name);
+        return descriptor;
+    }
+#else
     if (descriptor >= 0) return descriptor;
+#endif
     const int error = errno;
     if (const int guest = GuestError(error)) return Fail(guest);
     throw std::runtime_error("shm_open: creating the host anonymous file failed, errno=" + std::to_string(error));

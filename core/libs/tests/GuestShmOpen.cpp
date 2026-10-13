@@ -1,3 +1,4 @@
+#include "SceTypes.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #ifdef _WIN32
 #include "prx/libc/include/GuestArena.hpp"
@@ -7,9 +8,16 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+struct GuestIovec {
+    void* base;
+    std::size_t length;
+};
 extern "C" {
 int APS5_VABI shm_open_nid_postfix(const char*, int, int);
 int APS5_VABI ftruncate_nid_postfix(int, std::int64_t);
+std::int64_t APS5_VABI fstat_nid_disambig1_nid_postfix(int, FileStat*);
+std::int64_t APS5_VABI read_nid_postfix(int, void*, std::size_t);
+std::int64_t APS5_VABI readv_nid_postfix(int, const GuestIovec*, int);
 std::int64_t APS5_VABI pread_nid_postfix(int, void*, std::size_t, std::int64_t);
 std::int64_t APS5_VABI pwrite_nid_disambig1_nid_postfix(int, const void*, std::size_t, std::int64_t);
 std::int64_t APS5_VABI write_nid_postfix(int, const char*, std::int64_t);
@@ -75,6 +83,57 @@ static void RequireSharedMapping() {
 #endif
     Require(close_nid_postfix(object) == 0);
 }
+static std::int64_t ObjectSize(int descriptor) {
+    FileStat status{};
+    Require(fstat_nid_disambig1_nid_postfix(descriptor, &status) == 0);
+    return status.st_size;
+}
+static void RequireUnalignedObject() {
+    const int object = shm_open_nid_postfix(anonymous, 0x2, 0);
+    Require(object >= 0 && ftruncate_nid_postfix(object, 0x4100) == 0);
+    Require(ObjectSize(object) == 0x4100);
+    Require(lseek_nid_postfix(object, 0, 2) == 0x4100);
+    RequireInvalidSeek(object, 0x4101, 0);
+    char buffer[0x200];
+    std::memset(buffer, 1, sizeof(buffer));
+    Require(lseek_nid_postfix(object, 0x4000, 0) == 0x4000);
+    Require(read_nid_postfix(object, buffer, sizeof(buffer)) == 0x100 && buffer[0] == 0 && buffer[0xff] == 0 && buffer[0x100] == 1);
+    Require(read_nid_postfix(object, buffer, sizeof(buffer)) == 0);
+    Require(pread_nid_postfix(object, buffer, 0x10, 0x40ff) == 1);
+    Require(pread_nid_postfix(object, buffer, 0x10, 0x4100) == 0);
+    const GuestIovec vectors[2] = {{buffer, 0x20}, {buffer + 0x20, 0x40}};
+    Require(lseek_nid_postfix(object, 0x40c0, 0) == 0x40c0 && readv_nid_postfix(object, vectors, 2) == 0x40);
+    const char text[] = "unaligned";
+    Require(pwrite_nid_disambig1_nid_postfix(object, text, sizeof(text), 0x40fc) == 4);
+    const int copy = dup_nid_postfix(object);
+    Require(copy >= 0 && ObjectSize(copy) == 0x4100 && close_nid_postfix(copy) == 0);
+    auto* mapped = static_cast<char*>(mmap_nid_postfix(nullptr, 0x8000, 3, 0x1, object, 0));
+    Require(mapped != failedMapping);
+    Require(std::memcmp(mapped + 0x40fc, text, 4) == 0 && mapped[0x4100] == 0 && mapped[0x4fff] == 0);
+    mapped[0x10] = 'x';
+    Require(pread_nid_postfix(object, buffer, 1, 0x10) == 1 && buffer[0] == 'x');
+    mapped[0x4100] = 'z';
+#ifdef _WIN32
+    Require(mapped[0x7fff] == 0);
+    mapped[0x7fff] = 'w';
+#endif
+    Require(ObjectSize(object) == 0x4100 && pread_nid_postfix(object, buffer, 1, 0x4100) == 0);
+    Require(ftruncate_nid_postfix(object, 0x4080) == 0);
+    Require(ObjectSize(object) == 0x4080 && mapped[0x4080] == 0 && mapped[0x40fc] == 0 && mapped[0x4100] == 0);
+#ifdef _WIN32
+    Require(mapped[0x7fff] == 0);
+#endif
+    Require(ftruncate_nid_postfix(object, 0x4100) == 0);
+    std::memset(buffer, 1, sizeof(buffer));
+    Require(pread_nid_postfix(object, buffer, 0x80, 0x4080) == 0x80);
+    for (int i = 0; i < 0x80; ++i) Require(buffer[i] == 0);
+    Require(munmap_nid_postfix(mapped, 0x8000) == 0);
+#ifdef _WIN32
+    *__error_nid_postfix() = 0;
+    Require(mmap_nid_postfix(nullptr, 0xc000, 3, 0x1, object, 0) == failedMapping && *__error_nid_postfix() == 45);
+#endif
+    Require(close_nid_postfix(object) == 0);
+}
 int main() {
     *__error_nid_postfix() = 13;
     const int first = shm_open_nid_postfix(anonymous, 0x100202, 0600);
@@ -115,6 +174,7 @@ int main() {
     Require(close_nid_postfix(copy) == 0);
     Require(pread_nid_postfix(third, &last, 1, 0x4000) == 0);
     RequireSharedMapping();
+    RequireUnalignedObject();
     Require(close_nid_postfix(first) == 0 && close_nid_postfix(second) == 0 && close_nid_postfix(third) == 0);
     RequireInvalid(anonymous, 0x0);
     RequireInvalid(anonymous, 0x200);

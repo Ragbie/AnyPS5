@@ -170,10 +170,9 @@ static int NativeFlock(int descriptor, int operation) {
     return File::Flock(descriptor, operation);
 }
 std::int64_t NativePositioned_nid_no_patch(int descriptor, void* buf, std::size_t nbytes, std::int64_t offset, bool write) {
-    if (write) {
-        const auto result = File::PwriteSharedMemory_nid_no_patch(descriptor, buf, nbytes, offset);
-        if (result != -2) return result;
-    }
+    const auto result = write ? File::PwriteSharedMemory_nid_no_patch(descriptor, buf, nbytes, offset)
+                              : File::PreadSharedMemory_nid_no_patch(descriptor, buf, nbytes, offset);
+    if (result != -2) return result;
     return NativePositionedFile_nid_no_patch(descriptor, buf, nbytes, offset, write);
 }
 std::int64_t NativePositionedFile_nid_no_patch(int descriptor, void* buf, std::size_t nbytes, std::int64_t offset, bool write) {
@@ -211,10 +210,9 @@ static std::int64_t NativeTransfer(int descriptor, void* buf, std::size_t nbytes
     if (nbytes > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("NativeTransfer: nbytes exceeds platform limit");
     }
-    if (write) {
-        const auto result = File::WriteSharedMemory_nid_no_patch(descriptor, buf, nbytes);
-        if (result != -2) return result;
-    }
+    const auto result = write ? File::WriteSharedMemory_nid_no_patch(descriptor, buf, nbytes)
+                              : File::ReadSharedMemory_nid_no_patch(descriptor, buf, nbytes);
+    if (result != -2) return result;
     return write ? ::_write(descriptor, buf, static_cast<unsigned int>(nbytes)) : ::_read(descriptor, buf, static_cast<unsigned int>(nbytes));
 }
 static bool NativeIsDisk(int descriptor) {
@@ -506,6 +504,7 @@ int APS5_VABI close_nid_postfix(int d) {
 #ifdef _WIN32
     File::ForgetDirectoryDescriptor(d);
     File::ForgetFileLock(d);
+    File::ForgetSharedMemory_nid_no_patch(d);
     return WithoutParameterHandler([d] { return ::_close(d); });
 #else
     return ::close(d);
@@ -550,7 +549,10 @@ int APS5_VABI dup_nid_postfix(int d) {
     if (IsKqueueDescriptor(d)) throw std::runtime_error(std::string(__func__) + ": duplicating a kqueue descriptor is not supported");
 #ifdef _WIN32
     const int duplicate = WithoutParameterHandler([d] { return ::_dup(d); });
-    if (duplicate >= 0) File::DuplicateDirectoryDescriptor(d, duplicate);
+    if (duplicate >= 0) {
+        File::DuplicateDirectoryDescriptor(d, duplicate);
+        File::DuplicateSharedMemory_nid_no_patch(d, duplicate);
+    }
 #else
     const int duplicate = ::dup(d);
 #endif
@@ -572,6 +574,7 @@ int APS5_VABI dup2_nid_postfix(int from, int to) {
 #ifdef _WIN32
         File::ForgetDirectoryDescriptor(to);
         File::ForgetFileLock(to);
+        File::ForgetSharedMemory_nid_no_patch(to);
 #endif
         return to;
     }
@@ -589,6 +592,7 @@ int APS5_VABI dup2_nid_postfix(int from, int to) {
     GuestSockets::Forget(to);
     File::ForgetDirectoryDescriptor(to);
     File::DuplicateDirectoryDescriptor(from, to);
+    File::DuplicateSharedMemory_nid_no_patch(from, to);
     File::ForgetFileLock(to);
     File::ForgetRandomDevice(to);
     if (sourceIsRandom) File::RememberRandomDevice(to);
