@@ -1,4 +1,7 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
+#ifdef _WIN32
+#include "prx/libc/include/GuestArena.hpp"
+#endif
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -12,6 +15,8 @@ std::int64_t APS5_VABI pwrite_nid_disambig1_nid_postfix(int, const void*, std::s
 std::int64_t APS5_VABI write_nid_postfix(int, const char*, std::int64_t);
 std::int64_t APS5_VABI lseek_nid_postfix(int, std::int64_t, int);
 void* APS5_VABI mmap_nid_postfix(void*, std::size_t, int, int, int, std::int64_t) noexcept;
+int APS5_VABI munmap_nid_postfix(void*, std::size_t) noexcept;
+int APS5_VABI mprotect_nid_postfix(void*, std::size_t, int) noexcept;
 int APS5_VABI dup_nid_postfix(int);
 int APS5_VABI close_nid_postfix(int);
 int* APS5_VABI __error_nid_postfix();
@@ -27,6 +32,48 @@ static void RequireInvalidSeek(int descriptor, std::int64_t offset, int whence) 
     *__error_nid_postfix() = 0;
     Require(lseek_nid_postfix(descriptor, offset, whence) == -1);
     Require(*__error_nid_postfix() == 22);
+}
+static void* const failedMapping = reinterpret_cast<void*>(-1);
+static void RequireSharedMapping() {
+    const int object = shm_open_nid_postfix(anonymous, 0x2, 0);
+    Require(object >= 0 && ftruncate_nid_postfix(object, 0x8000) == 0);
+    const char text[] = "mapped";
+    Require(pwrite_nid_disambig1_nid_postfix(object, text, sizeof(text), 0x4000) == static_cast<std::int64_t>(sizeof(text)));
+    auto* whole = static_cast<char*>(mmap_nid_postfix(nullptr, 0x8000, 3, 0x1, object, 0));
+    Require(whole != failedMapping);
+    Require(std::memcmp(whole + 0x4000, text, sizeof(text)) == 0);
+    whole[0x10] = 'x';
+    char back = 0;
+    Require(pread_nid_postfix(object, &back, 1, 0x10) == 1 && back == 'x');
+    auto* second = static_cast<char*>(mmap_nid_postfix(nullptr, 0x4000, 3, 0x1, object, 0x4000));
+    Require(second != failedMapping && second != whole + 0x4000);
+    second[1] = 'y';
+    Require(whole[0x4001] == 'y');
+    Require(mprotect_nid_postfix(second, 0x4000, 1) == 0 && second[0] == 'm');
+#ifdef _WIN32
+    void* written[8] = {};
+    std::size_t writtenCount = 8;
+    Require(!GuestArena::GuestArenaCollectWrites_nid_postfix(reinterpret_cast<std::uintptr_t>(whole), 0x8000, written, &writtenCount, true));
+#endif
+    Require(munmap_nid_postfix(second, 0x4000) == 0 && munmap_nid_postfix(whole, 0x8000) == 0);
+#ifdef _WIN32
+    *__error_nid_postfix() = 0;
+    Require(mmap_nid_postfix(nullptr, 0x4000, 3, 0x2, object, 0) == failedMapping && *__error_nid_postfix() == 45);
+    *__error_nid_postfix() = 0;
+    Require(mmap_nid_postfix(nullptr, 0xc000, 3, 0x1, object, 0) == failedMapping && *__error_nid_postfix() == 45);
+    void* held = mmap_nid_postfix(nullptr, 0x4000, 3, 0x1, object, 0);
+    Require(held != failedMapping);
+    bool threw = false;
+    try {
+        ftruncate_nid_postfix(object, 0x4000);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    Require(threw);
+    Require(munmap_nid_postfix(held, 0x4000) == 0);
+    Require(ftruncate_nid_postfix(object, 0x4000) == 0);
+#endif
+    Require(close_nid_postfix(object) == 0);
 }
 int main() {
     *__error_nid_postfix() = 13;
@@ -67,11 +114,7 @@ int main() {
     Require(pwrite_nid_disambig1_nid_postfix(copy, text, sizeof(text), 0x3fff) == 1);
     Require(close_nid_postfix(copy) == 0);
     Require(pread_nid_postfix(third, &last, 1, 0x4000) == 0);
-#ifdef _WIN32
-    *__error_nid_postfix() = 0;
-    Require(mmap_nid_postfix(nullptr, 0x4000, 3, 0x1, third, 0) == reinterpret_cast<void*>(-1));
-    Require(*__error_nid_postfix() == 45);
-#endif
+    RequireSharedMapping();
     Require(close_nid_postfix(first) == 0 && close_nid_postfix(second) == 0 && close_nid_postfix(third) == 0);
     RequireInvalid(anonymous, 0x0);
     RequireInvalid(anonymous, 0x200);

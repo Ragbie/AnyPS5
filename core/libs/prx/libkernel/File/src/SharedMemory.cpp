@@ -9,6 +9,7 @@
 #include <string_view>
 #include <vector>
 #include <stdexcept>
+#include <system_error>
 #include <string>
 #include <cstdint>
 #include <limits>
@@ -20,7 +21,6 @@
 #include <windows.h>
 #include <fcntl.h>
 #include <io.h>
-#include <share.h>
 #include <sys/stat.h>
 #include <filesystem>
 #include <random>
@@ -236,15 +236,21 @@ int CreateAnonymousFile() {
     const auto seed = std::to_wstring(std::random_device{}());
     for (int attempt = 0; attempt < 64; ++attempt) {
         const auto path = directory / (std::wstring(anonymousObjectPrefix) + seed + L"-" + std::to_wstring(sequence++));
-        int descriptor = -1;
-        const int error = _wsopen_s(&descriptor, path.c_str(),
-                                    _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY | _O_TEMPORARY | _O_SHORT_LIVED | _O_NOINHERIT,
-                                    _SH_DENYNO, _S_IREAD | _S_IWRITE);
-        if (error == 0) return descriptor;
-        if (error != EEXIST) {
-            errno = error;
+        const HANDLE file = ::CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE,
+                                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, CREATE_NEW,
+                                          FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            const DWORD error = ::GetLastError();
+            if (error == ERROR_FILE_EXISTS) continue;
+            errno = WindowsOpenError_nid_no_patch(error);
             return -1;
         }
+        const int descriptor = ::_open_osfhandle(reinterpret_cast<std::intptr_t>(file), _O_BINARY);
+        if (descriptor >= 0) return descriptor;
+        const int error = errno;
+        ::CloseHandle(file);
+        errno = error;
+        return -1;
     }
     errno = EEXIST;
     return -1;
@@ -486,11 +492,30 @@ int TruncateSharedMemory_nid_no_patch(int descriptor, std::int64_t length) {
     const auto fd = guard.Descriptor();
 #ifdef _WIN32
     const int result = static_cast<int>(::_chsize_s(fd, length));
+    if (result != 0 && _doserrno == ERROR_USER_MAPPED_FILE) {
+        NotImplemented_nid_no_patch("ftruncate shrinking a mapped shared memory object on Windows");
+    }
 #else
     const int result = ::ftruncate(fd, static_cast<off_t>(length));
 #endif
     return result;
 }
+
+#ifdef _WIN32
+void* SharedMemorySection_nid_no_patch(int descriptor, std::uint64_t end) {
+    SharedMemoryLock guard(descriptor);
+    if (!guard.IsShared()) throw std::system_error(EBADF, std::generic_category(), "map shared memory: not a shared memory descriptor");
+    if (guard.Error() != 0) throw std::system_error(guard.Error(), std::generic_category(), "map shared memory");
+    if (!guard.Refresh()) throw std::system_error(errno, std::generic_category(), "map shared memory: reading the object size");
+    if (end > static_cast<std::uint64_t>(guard.status.st_size)) {
+        throw std::system_error(ENOTSUP, std::generic_category(), "map shared memory: beyond the object size");
+    }
+    const auto handle = reinterpret_cast<HANDLE>(::_get_osfhandle(guard.Descriptor()));
+    const HANDLE section = ::CreateFileMappingW(handle, nullptr, PAGE_EXECUTE_READWRITE, 0, 0, nullptr);
+    if (section == nullptr) throw std::system_error(ENOMEM, std::generic_category(), "map shared memory: creating the section");
+    return section;
+}
+#endif
 
 }
 

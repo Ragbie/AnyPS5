@@ -3,6 +3,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libkernel/File/include/SharedMemory.hpp"
 #include <algorithm>
 #include <cerrno>
 #include <iterator>
@@ -918,6 +919,27 @@ int DoMapFileBacked_nid_no_patch(void** addr, size_t len, int prot, int flags, i
         throw std::system_error(error, std::generic_category(), "map guest shared memory");
     }
     try {
+        mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0, false);
+    } catch (...) {
+        Unmap(mapped, len);
+        throw;
+    }
+    *addr = mapped;
+    EraseReservations(mapped, len);
+    RecordProtection(mapped, len, prot);
+    Trace("map file %p+0x%zx offset=0x%llx prot=0x%x flags=0x%x", mapped, len, static_cast<unsigned long long>(offset), prot, flags);
+    return 0;
+#elif defined(_WIN32)
+    if ((flags & 3) != 1) throw std::system_error(ENOTSUP, std::generic_category(), "private file-backed guest mmap is not supported on this host");
+    const std::unique_ptr<void, decltype(&CloseHandle)> section(File::SharedMemorySection_nid_no_patch(descriptor, offset + len), CloseHandle);
+    GuestAllocations::Mutation mutation;
+    const int placementFlags = flags & (GuestMapFixedFlag | 0x80 | 0x400000);
+    flags = PlaceHintInReservation(*addr, len, placementFlags);
+    if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
+    ReplaceFixedOverlap(mutation, *addr, len, flags);
+    void* mapped = MapPlaced(*addr, len, PROT_NONE, flags, alignment);
+    try {
+        GuestArena::GuestArenaMap_nid_postfix(mapped, len, section.get(), offset, WinProtFromPosix(LinuxProtFromSce(prot)), false);
         mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0, false);
     } catch (...) {
         Unmap(mapped, len);

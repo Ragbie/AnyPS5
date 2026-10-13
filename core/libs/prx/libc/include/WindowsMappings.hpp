@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <mutex>
 #include <map>
+#include <set>
 #include <memory>
 #include <vector>
 #include <stdexcept>
@@ -74,7 +75,7 @@ public:
         reset(reinterpret_cast<std::uintptr_t>(address), bytes);
     }
 
-    void Map(void* address, std::size_t bytes, HANDLE section, std::uint64_t offset, DWORD protection) {
+    void Map(void* address, std::size_t bytes, HANDLE section, std::uint64_t offset, DWORD protection, bool tracked = true) {
         std::lock_guard lock(mutex);
         auto cursor = reinterpret_cast<std::uintptr_t>(address);
         reset(cursor, bytes);
@@ -91,14 +92,15 @@ public:
             DWORD previous;
             if (!VirtualProtect(page, pageBytes, protection, &previous)) fail("protect shared guest page");
             const auto key = std::make_pair(reinterpret_cast<std::uintptr_t>(section), offset + done);
-            auto shared = physical[key].lock();
+            auto shared = tracked ? physical[key].lock() : std::shared_ptr<SharedPage>();
             if (!shared) {
                 shared = std::make_shared<SharedPage>();
-                physical[key] = shared;
+                if (tracked) physical[key] = shared;
             }
             const auto base = cursor + done;
             shared->aliases.push_back(base);
-            views.emplace(base, View{shared, protection, {}, 0, owned, offset + done, 0});
+            views.emplace(base, View{shared, protection, {}, 0, owned, offset + done, 0, 0, tracked});
+            if (!tracked) untrackedBases.insert(base);
             remember(freshRanges, base, base + pageBytes);
             invalidate(*shared);
         }
@@ -228,6 +230,7 @@ public:
         const auto capacity = *count;
         *count = 0;
         const auto end = address + bytes;
+        if (const auto untracked = untrackedBases.lower_bound(address & ~(pageBytes - 1)); untracked != untrackedBases.end() && *untracked < end) return false;
         if (collection == Collection::Fresh) {
             const auto fresh = freshRanges.upper_bound(address);
             if ((fresh == freshRanges.begin() || std::prev(fresh)->second <= address) && (fresh == freshRanges.end() || fresh->first >= end)) return true;
@@ -392,6 +395,7 @@ private:
         std::uint64_t offset;
         std::uint32_t hostWrites;
         std::uint8_t collected = 0;
+        bool tracked = true;
     };
     using Ranges = std::map<std::uintptr_t, std::uintptr_t>;
 
@@ -524,6 +528,7 @@ private:
                 const auto found = views.find(cursor);
                 if (found != views.end()) {
                     std::erase(found->second.page->aliases, cursor);
+                    if (!found->second.tracked) untrackedBases.erase(cursor);
                     views.erase(found);
                     forget(freshRanges, cursor, cursor + pageBytes);
                 }
@@ -546,6 +551,7 @@ private:
     Ranges freshRanges;
     std::map<std::uintptr_t, View> views;
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
+    std::set<std::uintptr_t> untrackedBases;
     std::mutex mutex;
     AllocateFunction allocate = nullptr;
     MapFunction map = nullptr;

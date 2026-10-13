@@ -372,9 +372,9 @@ void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes) {
     WindowsMappings::Get().Reset(pointer, bytes);
 }
 
-void GuestArenaMap_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection) {
+void GuestArenaMap_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection, bool tracked) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("shared mapping", pointer, bytes);
-    WindowsMappings::Get().Map(pointer, bytes, section, offset, protection);
+    WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, tracked);
 }
 
 void* GuestArenaMapAlias_nid_postfix(std::uintptr_t address, std::size_t bytes) {

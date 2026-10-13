@@ -137,6 +137,9 @@ void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, int protecti
     } catch (const std::invalid_argument&) {
         return failed(GuestInvalid);
     } catch (const std::system_error& error) {
+#ifdef _WIN32
+        if (error.code().category() != std::generic_category()) return failed(GuestNoMemory);
+#endif
         const int hostError = error.code().value();
         if (hostError == ENOTSUP || hostError == EOPNOTSUPP) return failed(GuestNotSupported);
         if (hostError == EACCES || hostError == EPERM) return failed(GuestAccess);
