@@ -790,7 +790,15 @@ int SocketSendFlags(Socket& socket, int flags) {
     std::lock_guard lock(socket.modeMutex);
     return NativeSendFlags(socket.options.noSignal ? flags | GuestNoSignal : flags);
 }
-int WaitForTransfer(Socket& socket, bool send, int flags) {
+#ifdef _WIN32
+bool ReceiveWouldBlock(const Socket& socket) {
+    if (socket.type == 1) return PeerConnected(socket);
+    sockaddr_storage name{};
+    socklen_t size = sizeof(name);
+    return ::getsockname(socket.value, reinterpret_cast<sockaddr*>(&name), &size) == 0;
+}
+#endif
+int WaitForTransfer(Socket& socket, bool send, int flags, int receiver = -1) {
     if ((flags & GuestDontWait) != 0) {
 #ifdef _WIN32
         NativePollDescriptor entry{};
@@ -807,22 +815,38 @@ int WaitForTransfer(Socket& socket, bool send, int flags) {
         if (socket.options.nonblocking) return 0;
         timeout = send ? socket.options.sendTimeout : socket.options.receiveTimeout;
     }
-    if (timeout == 0) return 0;
+#ifdef _WIN32
+    const bool watched = receiver >= 0 && ReceiveWouldBlock(socket);
+#else
+    static_cast<void>(receiver);
+    constexpr bool watched = false;
+#endif
+    if (timeout == 0 && !watched) return 0;
+    const ReadWatch watch(watched ? std::vector<int>{receiver} : std::vector<int>{});
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout >> 32) +
         std::chrono::nanoseconds((static_cast<std::int64_t>(static_cast<std::uint32_t>(timeout)) * 1000000000) >> 32);
     for (;;) {
-        const auto left = deadline - std::chrono::steady_clock::now();
-        if (left <= std::chrono::steady_clock::duration::zero()) return 35;
-        const int milliseconds = static_cast<int>(std::min<std::int64_t>(std::chrono::ceil<std::chrono::milliseconds>(left).count(), INT_MAX));
-        NativePollDescriptor entry{};
-        entry.fd = socket.value;
+        if (watched && ReceiveShut(socket)) return 0;
+        int milliseconds = -1;
+        if (timeout != 0) {
+            const auto left = deadline - std::chrono::steady_clock::now();
+            if (left <= std::chrono::steady_clock::duration::zero()) return 35;
+            milliseconds = static_cast<int>(std::min<std::int64_t>(std::chrono::ceil<std::chrono::milliseconds>(left).count(), INT_MAX));
+        }
+        NativePollDescriptor entries[2]{};
+        entries[0].fd = socket.value;
 #ifdef _WIN32
-        entry.events = static_cast<short>(send ? POLLWRNORM : POLLRDNORM);
-        const int ready = WSAPoll(&entry, 1, milliseconds);
-        if (ready != 0) return 0;
+        entries[0].events = static_cast<short>(send ? POLLWRNORM : POLLRDNORM);
+        if (watched) {
+            entries[1].fd = ThreadWaker().value;
+            entries[1].events = POLLRDNORM;
+        }
+        const int ready = WSAPoll(entries, watched ? 2 : 1, milliseconds);
+        if (ready < 0 || entries[0].revents != 0) return 0;
+        if (entries[1].revents != 0) DrainWaker(entries[1].fd);
 #else
-        entry.events = static_cast<short>(send ? POLLOUT : POLLIN);
-        const int ready = ::poll(&entry, 1, milliseconds);
+        entries[0].events = static_cast<short>(send ? POLLOUT : POLLIN);
+        const int ready = ::poll(entries, 1, milliseconds);
         if (ready > 0 || (ready < 0 && errno != EINTR)) return 0;
 #endif
     }
@@ -1418,7 +1442,8 @@ std::int64_t APS5_VABI recv_nid_postfix(int descriptor, void* buffer, std::uint6
     const GuestArena::HostWrite destination(length == 0 ? nullptr : buffer, static_cast<std::size_t>(length));
     if (!destination.Open()) return Fail(14);
     if (const int answered = ReceiveAnsweredHere(*socket, length); answered >= 0) return answered == 0 ? 0 : Fail(answered);
-    if (const int waited = WaitForTransfer(*socket, false, flags)) return Fail(waited);
+    if (const int waited = WaitForTransfer(*socket, false, flags, descriptor)) return Fail(waited);
+    if (ReceiveShut(*socket)) return 0;
     const auto result = ::recv(socket->value, static_cast<char*>(buffer), static_cast<int>(length),
         NativeReceiveFlags(flags, socket->type));
 #ifdef _WIN32
@@ -1578,7 +1603,11 @@ std::int64_t APS5_VABI recvfrom_nid_postfix(int descriptor, void* buffer, std::u
     }
     sockaddr_storage native{};
     socklen_t size = sizeof(native);
-    if (const int waited = WaitForTransfer(*socket, false, flags)) return Fail(waited);
+    if (const int waited = WaitForTransfer(*socket, false, flags, descriptor)) return Fail(waited);
+    if (ReceiveShut(*socket)) {
+        if (address) *addressLength = 0;
+        return 0;
+    }
     auto result = ::recvfrom(socket->value, static_cast<char*>(buffer), static_cast<int>(length),
         NativeReceiveFlags(flags, socket->type), reinterpret_cast<sockaddr*>(&native), &size);
 #ifdef _WIN32
@@ -1715,11 +1744,12 @@ std::int64_t APS5_VABI recvmsg_nid_postfix(int descriptor, GuestMsghdr* message,
     sockaddr_storage native{};
     socklen_t size = 0;
     std::int64_t received = 0;
-    const bool shut = ReceiveShut(*socket);
+    bool shut = ReceiveShut(*socket);
     if (!shut && (total != 0 || socket->type == 1 || ReadableNow(*socket))) {
         size = sizeof(native);
-        if (const int waited = WaitForTransfer(*socket, false, flags)) return Fail(waited);
-        received = ::recvfrom(socket->value, buffer.data(), static_cast<int>(buffer.size()),
+        if (const int waited = WaitForTransfer(*socket, false, flags, descriptor)) return Fail(waited);
+        shut = ReceiveShut(*socket);
+        if (!shut) received = ::recvfrom(socket->value, buffer.data(), static_cast<int>(buffer.size()),
             NativeReceiveFlags(flags, socket->type), reinterpret_cast<sockaddr*>(&native), &size);
         if (received < 0) {
 #ifdef _WIN32
