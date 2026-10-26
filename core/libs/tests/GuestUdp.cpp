@@ -3,6 +3,7 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -135,6 +136,39 @@ static void CheckShutReadUnconnected() {
     Require(close_nid_postfix(receiver) == 0 && close_nid_postfix(sender) == 0);
 }
 
+#ifndef __APPLE__
+static void CheckShutReadEndsBlockedReceive() {
+    const int receiver = socket_nid_postfix(2, 2, 0);
+    const int sender = socket_nid_postfix(2, 2, 0);
+    Require(receiver >= 0 && sender >= 0);
+    std::array<unsigned char, 16> address{16, 2, 0, 0, 127, 0, 0, 1};
+    Require(bind_nid_postfix(receiver, address.data(), address.size()) == 0);
+    std::uint32_t size = address.size();
+    Require(getsockname_nid_postfix(receiver, address.data(), &size) == 0);
+    std::atomic<bool> entered{false};
+    std::atomic<bool> returned{false};
+    std::int64_t received = -2;
+    std::chrono::steady_clock::duration waited{};
+    std::thread waiter([&] {
+        char buffer[4];
+        const auto start = std::chrono::steady_clock::now();
+        entered = true;
+        received = recv_nid_postfix(receiver, buffer, sizeof(buffer), 0);
+        waited = std::chrono::steady_clock::now() - start;
+        returned = true;
+    });
+    while (!entered) std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    Require(!returned);
+    Require(shutdown_nid_postfix(receiver, 0) == -1 && *__error_nid_postfix() == 57);
+    for (int poll = 0; poll < 100 && !returned; ++poll) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    if (!returned) Require(sendto_nid_postfix(sender, "x", 1, 0, address.data(), address.size()) == 1);
+    waiter.join();
+    Require(received == 0 && waited >= std::chrono::milliseconds(40) && waited < std::chrono::seconds(2));
+    Require(close_nid_postfix(receiver) == 0 && close_nid_postfix(sender) == 0);
+}
+#endif
+
 static void CheckDontWait() {
     const int receiver = socket_nid_postfix(2, 2, 0);
     const int sender = socket_nid_postfix(2, 2, 0);
@@ -174,6 +208,9 @@ int main() {
     CheckDontWait();
     CheckSendToPortZero();
     CheckShutReadUnconnected();
+#ifndef __APPLE__
+    CheckShutReadEndsBlockedReceive();
+#endif
     const int receiver = socket_nid_postfix(2, 2, 0);
     const int sender = socket_nid_postfix(2, 2, 17);
     Require(receiver >= 0 && sender >= 0 && receiver != sender);
